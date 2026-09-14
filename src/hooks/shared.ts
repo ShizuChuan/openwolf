@@ -1,3 +1,9 @@
+import {hookReceipt} from './visibility.js';
+import {observeCheckpoint} from "./handoff-state.js";
+import {bridgedInput, delegateRuntime, scheduleUpdate} from "./runtime-updates.js";
+import { normalizeSession } from "./session-state.js";
+export { normalizeSession } from "./session-state.js";
+import { withFileLock, HOOK_LOCK_BUDGET_MS } from "./anatomy-lock.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
@@ -26,9 +32,19 @@ function projectDirFromScriptLocation(): string | null {
 }
 
 export function getProjectDir(): string {
+  if (hookCwd) {
+    let dir = path.resolve(hookCwd);
+    while (true) {
+      if (fs.existsSync(path.join(dir, ".wolf"))) return dir;
+      if (fs.existsSync(path.join(dir, ".git")) || path.dirname(dir) === dir) break;
+      dir = path.dirname(dir);
+    }
+    return hookCwd;
+  }
   return (
     process.env.CLAUDE_PROJECT_DIR ||
     process.env.CODEX_PROJECT_ROOT ||
+    process.env.GROK_WORKSPACE_ROOT ||
     process.env.OPENWOLF_PROJECT_ROOT ||
     projectDirFromScriptLocation() ||
     process.cwd()
@@ -41,11 +57,12 @@ export function getWolfDir(): string {
 
 /** Which agent harness invoked this hook — used for per-agent ledger attribution. */
 export function detectAgent(): string {
+  if(process.env.GROK_HOOK_EVENT||process.env.GROK_SESSION_ID)return "grok";
   // CLAUDECODE is set in every Claude Code hook process; CLAUDE_PROJECT_DIR is
   // not set at all, so checking it alone attributed real Claude sessions to
   // "default" and lost their per-agent ledger rows.
   if (process.env.CLAUDECODE || process.env.CLAUDE_CODE_ENTRYPOINT || process.env.CLAUDE_PROJECT_DIR) return "claude";
-  if (process.env.CODEX_PROJECT_ROOT || process.env.CODEX_SANDBOX) return "codex";
+  if (process.env.CODEX_PROJECT_ROOT || process.env.CODEX_SANDBOX || process.env.CODEX_THREAD_ID) return "codex";
   if (process.env.OPENCODE || process.env.OPENCODE_PROJECT_ROOT) return "opencode";
   return "default";
 }
@@ -107,8 +124,17 @@ export function hookMain(hookName: string, fn: () => void | Promise<void>): void
     process.exit(0);
   }
   Promise.resolve()
-    .then(fn)
-    .then(() => {
+    .then(() => readStdin())
+    .then(async raw => {
+      if (hookName === "session-start" || hookName === "user-prompt-submit") scheduleUpdate(getProjectDir());
+      try { if (await delegateRuntime(getProjectDir(), hookName, raw)) return true; } catch {}
+      await fn();
+      try { if (["precompact","session-end","stop","user-prompt-submit","post-write","post-bash"].includes(hookName)) observeCheckpoint(getProjectDir(),detectAgent(),hookName,JSON.parse(raw)); } catch {}
+      if(hookName==="stop")try{const notice=hookReceipt(getProjectDir(),detectAgent(),{...JSON.parse(raw),prompt_id:String(readJSON<Record<string,unknown>>(getSessionFilePath(JSON.parse(raw)),{}).stop_count??0)});if(notice)process.stdout.write(JSON.stringify({systemMessage:notice}))}catch{}
+      return false;
+    })
+    .then(delegated => {
+      if (delegated) return;
       recordHeartbeat(hookName);
       process.exit(0);
     })
@@ -136,14 +162,21 @@ export function getSessionFilePath(hookInput: { session_id?: string } | undefine
 }
 
 /** Delete session state files older than maxAgeDays (called from session-start). */
-export function gcSessionFiles(maxAgeDays = 7): void {
+export function gcSessionFiles(maxAgeDays = 7, wolfDir = getWolfDir()): void {
   try {
-    const dir = path.join(getWolfDir(), "hooks", "sessions");
+    const dir = path.join(wolfDir, "hooks", "sessions");
     const cutoff = Date.now() - maxAgeDays * 24 * 3600 * 1000;
     for (const f of fs.readdirSync(dir)) {
       if (!f.endsWith(".json")) continue;
       try {
-        if (fs.statSync(path.join(dir, f)).mtimeMs < cutoff) fs.unlinkSync(path.join(dir, f));
+        const file = path.join(dir, f);
+        const state = readJSON<Record<string, unknown>>(file, {});
+        if (state.ended && fs.statSync(file).mtimeMs < cutoff) {
+          const pending = file + ".events";
+          if (fs.existsSync(pending) && fs.readdirSync(pending).length) continue;
+          if (fs.existsSync(pending)) fs.rmdirSync(pending);
+          fs.unlinkSync(file);
+        }
       } catch {}
     }
   } catch {}
@@ -151,7 +184,9 @@ export function gcSessionFiles(maxAgeDays = 7): void {
 
 export function readJSON<T = unknown>(filePath: string, fallback: T): T {
   try {
-    return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
+    const value = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    return (/[/\\]hooks[/\\]sessions[/\\][^/\\]+\.json$/.test(filePath)
+      ? normalizeSession(value, path.basename(filePath, ".json")) : value) as T;
   } catch {
     return fallback;
   }
@@ -200,7 +235,13 @@ export function readMarkdown(filePath: string): string {
 export function appendMarkdown(filePath: string, line: string): void {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.appendFileSync(filePath, line, "utf-8");
+  const ok = withFileLock(filePath + ".lock", HOOK_LOCK_BUDGET_MS, () => { fs.appendFileSync(filePath, line, "utf-8"); return true; });
+  if (ok === null) {
+    // Preserve an observation for maintenance to drain; never drop it.
+    const pending = filePath + ".pending";
+    fs.mkdirSync(pending, {recursive:true});
+    fs.writeFileSync(path.join(pending, `${Date.now()}-${crypto.randomUUID()}.json`), JSON.stringify({line}), {flag:"wx",mode:0o600});
+  }
 }
 
 // parseAnatomy / serializeAnatomy / AnatomyEntry moved to ./anatomy-store.ts —
@@ -692,15 +733,30 @@ export function timeShort(): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
 }
 
+let stdinPromise: Promise<string> | undefined;
+let hookCwd: string | undefined;
 export function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
+  if (stdinPromise) return stdinPromise;
+  const bridged = bridgedInput();
+  if (bridged !== undefined) {
+    try { const p=JSON.parse(bridged); if (typeof p.cwd === "string" && path.isAbsolute(p.cwd)) hookCwd=p.cwd; } catch {}
+    return stdinPromise=Promise.resolve(bridged);
+  }
+  stdinPromise = new Promise(resolve => {
     const chunks: Buffer[] = [];
-    process.stdin.on("data", (chunk) => chunks.push(chunk as Buffer));
-    process.stdin.on("end", () => resolve(Buffer.concat(chunks).toString("utf-8")));
-    // If no stdin data after 4s, resolve with whatever we have so far.
-    // On Windows, stdin delivery from Claude Code hooks can be slow.
-    setTimeout(() => resolve(chunks.length ? Buffer.concat(chunks).toString("utf-8") : "{}"), 4000);
+    const finish = () => {
+      clearTimeout(timer);
+      let raw = Buffer.concat(chunks).toString("utf8") || "{}";
+      if(process.env.GROK_HOOK_EVENT)try{const p=JSON.parse(raw);p.session_id=p.session_id??p.sessionId??process.env.GROK_SESSION_ID;p.cwd=p.cwd??process.env.GROK_WORKSPACE_ROOT;raw=JSON.stringify(p)}catch{}
+      try { const p = JSON.parse(raw); if (typeof p.cwd === "string" && path.isAbsolute(p.cwd)) hookCwd = p.cwd; } catch {}
+      resolve(raw);
+    };
+    const timer = setTimeout(finish, 4000);
+    process.stdin.on("data", chunk => chunks.push(Buffer.from(chunk)));
+    process.stdin.once("end", finish);
+    process.stdin.once("error", finish);
   });
+  return stdinPromise;
 }
 
 export function normalizePath(p: string): string {
@@ -945,3 +1001,5 @@ export function readTranscriptUsage(transcriptPath: string): RealUsage | null {
   if (Object.keys(perModel).length > 0) total.per_model = perModel;
   return total;
 }
+
+/** Complete state at every ingress, including a missed SessionStart (#96 @davdittrich). */

@@ -18,6 +18,7 @@ export interface SessionFileRead {
 }
 
 export interface SessionData {
+  agent?: string;
   session_id: string;
   started: string;
   files_read: Record<string, SessionFileRead>;
