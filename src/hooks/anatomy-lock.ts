@@ -1,3 +1,5 @@
+import { normalizeSession } from "./session-state.js";
+export { normalizeSession } from "./session-state.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -26,6 +28,7 @@ interface LockBody {
   pid: number;
   hostname: string;
   acquiredAt: number;
+  nonce?: string;
 }
 
 /** Dependency-free synchronous sleep. */
@@ -33,50 +36,41 @@ function sleep(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function tryAcquire(lockPath: string): boolean {
+function tryAcquire(lockPath: string): string | null {
+  const nonce = crypto.randomBytes(16).toString("hex");
   try {
-    const body: LockBody = { pid: process.pid, hostname: os.hostname(), acquiredAt: Date.now() };
+    const body: LockBody = { pid: process.pid, hostname: os.hostname(), acquiredAt: Date.now(), nonce };
     fs.writeFileSync(lockPath, JSON.stringify(body), { flag: "wx" });
-    return true;
-  } catch {
-    return false;
-  }
+    return nonce;
+  } catch { return null; }
 }
 
 function isStale(lockPath: string): boolean {
   try {
     const body = JSON.parse(fs.readFileSync(lockPath, "utf-8")) as LockBody;
-    if (typeof body.acquiredAt !== "number") return true;
-    if (Date.now() - body.acquiredAt > STALE_MS) return true;
-    if (body.hostname === os.hostname() && typeof body.pid === "number") {
-      try {
-        process.kill(body.pid, 0);
-        return false; // owner alive
-      } catch (err) {
-        return (err as NodeJS.ErrnoException).code === "ESRCH";
-      }
-    }
-    return false;
+    // Age never grants permission to evict a live writer.
+    if (body.hostname !== os.hostname() || !Number.isSafeInteger(body.pid) || body.pid <= 0) return false;
+    try { process.kill(body.pid, 0); return false; }
+    catch (err) { return (err as NodeJS.ErrnoException).code === "ESRCH"; }
   } catch {
-    // Unreadable/corrupt lock body: only age can save us; treat unreadable
-    // as stale so a garbage file cannot deadlock the system forever.
-    try {
-      const st = fs.statSync(lockPath);
-      return Date.now() - st.mtimeMs > STALE_MS;
-    } catch {
-      return false; // vanished — next acquire attempt will settle it
-    }
+    try { return Date.now() - fs.statSync(lockPath).mtimeMs > STALE_MS; }
+    catch { return false; }
   }
 }
 
-/** Steal a stale lock. Rename is atomic: exactly one competing stealer wins. */
 function trySteal(lockPath: string): void {
-  const graveyard = lockPath + "." + crypto.randomBytes(4).toString("hex") + ".stale";
+  // Serialize reapers, then inspect AGAIN. A stale observation made before
+  // another reaper ran must never rename a new owner's lock (#83).
+  const reaper = lockPath + ".reap";
+  let fd: number;
+  try { fd = fs.openSync(reaper, "wx"); } catch { return; }
   try {
-    fs.renameSync(lockPath, graveyard);
-    try { fs.unlinkSync(graveyard); } catch {}
-  } catch {
-    // Someone else won the steal or the owner released — keep waiting.
+    if (isStale(lockPath)) {
+      try { fs.unlinkSync(lockPath); } catch {}
+    }
+  } finally {
+    fs.closeSync(fd);
+    try { fs.unlinkSync(reaper); } catch {}
   }
 }
 
@@ -86,12 +80,14 @@ function trySteal(lockPath: string): void {
  * gracefully — skip the update, never block). Same mechanism as the anatomy
  * lock; used for the other multi-writer JSON files (cron-state, token-ledger).
  */
-export function withFileLock<T>(lockPath: string, budgetMs: number, fn: () => T): T | null {
+export function acquireLock(lockPath: string, budgetMs: number): (() => void) | null {
   const deadline = Date.now() + budgetMs;
   let attempt = 0;
+  let nonce: string | null = null;
 
   while (true) {
-    if (tryAcquire(lockPath)) break;
+    nonce = tryAcquire(lockPath);
+    if (nonce !== null) break;
     if (isStale(lockPath)) trySteal(lockPath);
     if (Date.now() >= deadline) return null;
     // Start tight, then back off. A contended session-state critical section
@@ -104,11 +100,18 @@ export function withFileLock<T>(lockPath: string, budgetMs: number, fn: () => T)
     attempt++;
   }
 
-  try {
-    return fn();
-  } finally {
-    try { fs.unlinkSync(lockPath); } catch {}
+  return () => {
+    try {
+      const owner = JSON.parse(fs.readFileSync(lockPath, "utf8")) as LockBody;
+      if (owner.nonce === nonce) fs.unlinkSync(lockPath);
+    } catch {}
   }
+}
+
+export function withFileLock<T>(lockPath: string, budgetMs: number, fn: () => T): T | null {
+  const release = acquireLock(lockPath, budgetMs);
+  if (!release) return null;
+  try { return fn(); } finally { release(); }
 }
 
 /**
@@ -157,6 +160,9 @@ export function mutateJSON<T>(
     } catch {
       current = fallback;
     }
+    if (/[/\\]hooks[/\\]sessions[/\\][^/\\]+\.json$/.test(filePath)) {
+      current = normalizeSession(current, path.basename(filePath, ".json")) as T;
+    }
     const returned = mutate(current);
     const next = returned === undefined ? current : (returned as T);
     writeJSONAtomic(filePath, next);
@@ -174,9 +180,8 @@ function writeJSONAtomic(filePath: string, data: unknown): void {
     fs.writeFileSync(tmp, body, "utf-8");
     fs.renameSync(tmp, filePath);
   } catch {
-    // Rename can fail on Windows while another process holds a handle.
-    try { fs.writeFileSync(filePath, body, "utf-8"); } catch {}
     try { fs.unlinkSync(tmp); } catch {}
+    throw new Error(`Atomic write failed: ${filePath}`);
   }
 }
 
@@ -187,3 +192,5 @@ function writeJSONAtomic(filePath: string, data: unknown): void {
 export function withAnatomyLock<T>(wolfDir: string, budgetMs: number, fn: () => T): T | null {
   return withFileLock(path.join(wolfDir, LOCK_FILE), budgetMs, fn);
 }
+
+/** Complete state at every ingress, including a missed SessionStart (#96 @davdittrich). */
